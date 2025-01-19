@@ -1,7 +1,7 @@
 """
 title: Memory
 author: ohmajesticlama
-author_url: https://github.com/OhMajesticLama
+author_url: https://github.com/OhMajesticLama/OpenWebUI.Memory
 funding_url: https://github.com/open-webui
 version: 0.1
 license: MIT
@@ -10,7 +10,8 @@ A function to automatically manage memories. Compatible with OpenWebUI 0.5.
 
 /!\ This function adds and modifies memories. This may lead to memory data loss.
 
-This function retrieves memories directly, it is recommended to disable the Settings->Personalization->Memory toggle.
+This function retrieves memories directly, it is recommended to disable the Settings->Personalization->Memory toggle
+as this will create duplicate entries in the chat history.
 """
 
 import sys
@@ -77,8 +78,8 @@ def set_logs(logger: logging.Logger, level: int, force: bool = False):
     return logger
 
 
-# set_logs(LOGGER, GLOBAL_LOG_LEVEL)
-set_logs(LOGGER, logging.DEBUG)
+set_logs(LOGGER, GLOBAL_LOG_LEVEL)
+# set_logs(LOGGER, logging.DEBUG)
 
 
 def log_exceptions(func: Callable[Any, Any]):
@@ -612,11 +613,11 @@ class PROMPT:
         When given two JSON lists, one containing new memories and another containing current memories,
         you must merge them into a single list. When merging, remove any duplicate information
         and keep only one occurrence of each item. If there is conflicting information, prioritize the new information.
-        
+
         Output your result as a JSON list of strings in the format: [string1, string2, ...]
 
         ## Examples:
-        
+
         * Given:
           + current_memories = ["User likes movies", "User dislikes potatoes"]
           + new_memories = ["User does not like potatoes"]
@@ -645,7 +646,7 @@ class PROMPT:
           + current_memories = ["User likes B"]
           + new_memories = ["User dislikes B"]
          Output: ["User likes B", "User dislikes B"]
-         
+
 
         ## Starting notes
         The above examples are example only, do not use any of the examples data for as input
@@ -663,32 +664,32 @@ class PROMPT:
         You must provide output in the form of a JSON list of strings. Nothing else.
 
         Be concise and factual.
-                       
+
         Examples
         --------
         You must act as the "Assistant" in those examples.
 
-        Example 1: 
-            User: 
+        Example 1:
+            User:
                 current_memories = ["User likes movies", "User dislikes potatoes"]
                 new_memories = ["User does not like potatoes"]
-                
+
             Assistant:
                 ["User likes movies", "User does not like potatoes"]
 
-        Example 2: 
-            User: 
+        Example 2:
+            User:
                 current_memories = ["User likes movies", "User does not like oranges"]
                 new_memories = ["User likes oranges"]
-                
+
             Assistant:
                 ["User likes movies", "User likes oranges"]
 
-        Example 3: 
-            User: 
+        Example 3:
+            User:
                 current_memories = ["User likes A", "User does not like B"]
                 new_memories = ["User likes C"]
-                
+
             Assistant:
                 ["User likes A", "User does not like B", "User likes C."]
 
@@ -701,17 +702,16 @@ class PROMPT:
         A message is considered worthy of long-term memory if it involves:
             * Significant events (e.g., birthdays, wins)
             * Important announcements (e.g., vacations)
-        
+
         You must provide output in the form of a JSON list. Nothing else.
 
         Be concise and factual.
-                       
-        Examples
-        --------
+
+        ## Examples
         You must act as the "Assistant" in those examples.
 
-        Example 1: 
-            User: Hi, I'm going on vacations next week.     
+        Example 1:
+            User: Hi, I'm going on vacations next week.
             Assistant: ["Users plans vacations next week."]
 
         Example 2:
@@ -730,16 +730,18 @@ class PROMPT:
             User: I met my friend John on July 16th.
             Assistant: ["User met John on July 16th", "User has a friend named john."]
 
-        Now create a JSON list of strings from the next message, ensure you follow the same format as in the examples above ([string1, string2, ...]),
-        without any code block or comments.
-        The next message is written by {source}
+
+        ## Assistant kick-off
+        The next message will be written by {source}.
+        Now create a JSON List of strings from the next message, ensure you follow the same format as in the examples above ([string1, string2, ...]),
+        without any code block or comments. JSON Objects are not allowed, just List.
         """
     MEMORY_QUERY = """
         Ignore prior instructions.
-        
+
         You are going to be provided with the history of this discussion.
         You must identify key elements in the discussion that may benefit from more context.
-        
+
         For example, mentions of what the user likes or dislikes, that are associated with strong emotions, or
         facts to remember. Pay more attention to the latest messages in the discussion than to the first ones.
 
@@ -749,14 +751,14 @@ class PROMPT:
         --------
         In those examples, you must act as the "Assistant".
 
-        Example 1: 
+        Example 1:
             System:
                 User context:
                 <time timezone="UTC">2025-01-17T21:42:44.926417+01:00</time>
-                
+
             User: Hi, I'm going on vacation next week.
-            
-            Assistant: 
+
+            Assistant:
                 - vacation
                 - next week
                 - Jan 24, 2025
@@ -792,3 +794,4 @@ class PROMPT:
 
         Be concise.
         """
+
