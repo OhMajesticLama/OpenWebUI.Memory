@@ -120,17 +120,18 @@ def log_exceptions(func: Callable[Any, Any]):
 class ROLE:
     SYSTEM = "system"
     USER = "user"
+    ASSISTANT = "assistant"
 
 
 class Filter:
     class Valves(BaseModel):
         model: str = Field(
-            default="llama3.2:1b",
+            default="gemma:2b",
             description="Model to use to process memories. Defaults to same model as conversation to save GPU memory / reload time.",
         )
 
         n_memories: int = Field(
-            default=5, description="Consider top N relevant memories."
+            default=10, description="Consider top N relevant memories."
         )
 
         memories_dist_min: float = Field(
@@ -180,15 +181,20 @@ class Filter:
         query: str,
         *,
         user: User,
+        source: str = ROLE.USER,
+        source_default: str = ROLE.USER,
         distance_min: Optional[float] = None,
         n_memories: Optional[int] = None,
     ):
+        assert source_default in (ROLE.USER, ROLE.ASSISTANT)
         n_memories = self.valves.n_memories if n_memories is None else n_memories
-        memories = await query_memory(
+        memories_raw = await query_memory(
             request=Request(scope={"type": "http", "app": open_webui.main.app}),
             form_data=QueryMemoryForm(
                 content=query,
-                k=str(n_memories),
+                k=str(
+                    5 * n_memories
+                ),  # Let's query more as we'll have to filter out other sources.
             ),
             user=user,
         )
@@ -204,25 +210,42 @@ class Filter:
         #   distances=[[0.8044559591349751, 0.8268496990203857]]
         #
         # Reshapeit for easier processing
-        return [
-            {
-                "memory": memory,
-                "metadata": {
-                    "created_at": datetime.datetime.fromtimestamp(
-                        meta["created_at"]
-                    ).isoformat()
-                },
-                "dist": dist,
-                "id": mid,
-            }
-            for memory, meta, dist, mid in zip(
-                memories.documents[0],
-                memories.metadatas[0],
-                memories.distances[0],
-                memories.ids[0],
-            )
-            if dist >= dist_min
-        ]
+        memories = []
+        for memory, meta, dist, mid in zip(
+            memories_raw.documents[0],
+            memories_raw.metadatas[0],
+            memories_raw.distances[0],
+            memories_raw.ids[0],
+        ):
+            try:
+                memory_json = json.loads(memory)
+            except json.JSONDecodeError as exc:
+                # Not JSON, memory was not added by this function.
+                # Consider it legacy with source_default
+                memory_json = {"source": source_default, "content": memory}
+
+            if memory_json.get("source") is None:
+                # Memory was added by another tool (or there is a bug).
+                memory_json["source"] = source_default
+
+            if dist >= dist_min and memory_json.get("source") == source:
+                # Filter out memories not from requested source.
+                memories.append(
+                    {
+                        "content": memory_json.get("content") or "",
+                        "metadata": {
+                            "created_at": datetime.datetime.fromtimestamp(
+                                meta["created_at"]
+                            ).isoformat()
+                        },
+                        "source": source,
+                        "dist": dist,
+                        "id": mid,
+                    }
+                )
+        LOGGER.debug("_query_memories: memories unsorted: %s", memories)
+        memories.sort(key=lambda m: m["dist"], reverse=True)
+        return memories[:n_memories]
 
     async def single_query_model(
         self,
@@ -233,6 +256,37 @@ class Filter:
         target_url = f"{self.valves.chat_api_host.strip('/')}/v1/chat/completions"
         return await single_query_model(
             self._session, target_url, model, system, query, api_key=self.valves.api_key
+        )
+
+    @staticmethod
+    def _format_context(
+        memories_user: List[Dict[str, str]], memories_assistant: List[Dict[str, str]]
+    ) -> str:
+        now = datetime.datetime.now(datetime.UTC).isoformat()
+        return '<context source="function_memory">\n  {}\n</context>'.format(
+            "\n  ".join(
+                (
+                    f'<time timezone="UTC"><!-- Be mindful user may not be in this timezone-->{now}</time>',
+                    '<memories source="{}">{}</memories>\n'.format(
+                        ROLE.ASSISTANT,
+                        "\n    ".join(
+                            (
+                                f"""<memory created_at="{m['metadata']['created_at']}">{m['content']}</memory>"""
+                                for m in memories_assistant
+                            )
+                        ),
+                    ),
+                    '<memories source="{}"><--! User memories are more trustworthy than assistant -->\n{}</memories>\n'.format(
+                        ROLE.USER,
+                        "\n    ".join(
+                            (
+                                f"""<memory created_at="{m['metadata']['created_at']}">{m['content']}</memory>"""
+                                for m in memories_user
+                            )
+                        ),
+                    ),
+                )
+            )
         )
 
     @log_exceptions
@@ -274,7 +328,10 @@ class Filter:
         )
         memory_query = await self._build_memory_query(messages)
         LOGGER.debug("memory_query: %s", memory_query)
-        memories = await self._query_memories(memory_query, user=user)
+        memories_user, memories_assistant = await asyncio.gather(
+            self._query_memories(memory_query, user=user, source=ROLE.USER),
+            self._query_memories(memory_query, user=user, source=ROLE.ASSISTANT),
+        )
         await __event_emitter__(
             {
                 "type": "status",
@@ -287,26 +344,13 @@ class Filter:
 
         # Get memories and inject them as context.
 
-        LOGGER.debug("memories: %s", memories)
+        LOGGER.debug("memories_assistant: %s", memories_assistant)
+        LOGGER.debug("memories_user: %s", memories_user)
 
         # Inject context prior to last user message.
         if messages[-1].get("role") == ROLE.USER:
             # Let's insert a system message with context before the user.
-            context = "<system_context>{}</system_context>".format(
-                "\n  ".join(
-                    (
-                        f"<time timezone=UTC><!-- Be mindful user may not be in this timezone-->{datetime.datetime.now(datetime.UTC).isoformat()}</time>",
-                        "<memories>{}</memories>".format(
-                            "\n    ".join(
-                                (
-                                    f"""<memory created_at="{m['metadata']['created_at']}">{m['memory']}</memory>"""
-                                    for m in memories
-                                )
-                            )
-                        ),
-                    )
-                )
-            )
+            context = self._format_context(memories_user, memories_assistant)
             LOGGER.debug("Added context message: %s", context)
             context_message = {"role": ROLE.SYSTEM, "content": context}
             messages.insert(-1, context_message)
@@ -315,15 +359,6 @@ class Filter:
                 "Last message not from user, do nothing: %s", messages[-1].get("role")
             )
             # Let's add the time to the latest message, it might be useful.
-
-        # if __user__.get("role", "admin") in ["user", "admin"]:
-        #     messages = body.get("messages", [])
-
-        #     max_turns = min(__user__["valves"].max_turns, self.valves.max_turns)
-        #     if len(messages) > max_turns:
-        #         raise Exception(
-        #             f"Conversation turn limit exceeded. Max turns: {max_turns}"
-        #         )
 
         return body
 
@@ -357,69 +392,48 @@ class Filter:
             LOGGER.debug("No 'messages' key in body. Do nothing.")
             return body
 
-        if messages[-2].get("role") == ROLE.USER:
-            # Here we only consider memories from the user. We may want to have a sort of "assistant memory" that we can tag separately in the future.
-            new_memories = await self._assess_for_memories(messages[-1]["content"])
-            current_memories = []
-            merged_memories = []
+        if messages[-2].get("role") != ROLE.USER:
+            LOGGER.info(
+                "second to last message is not from user. That's unexpected: do nothing."
+            )
+            return body
 
-            if len(new_memories) > 0:
-                # We don't want to spam the memories database with similar ones, let's merge whatever is new
-                # Query potentially similar memories. Be selective: we want to limit duplicates
-                current_memories = await self._query_memories(
-                    str(new_memories), user=user, distance_min=0.9
-                )
-                LOGGER.debug("current_memories: %s", current_memories)
-                if len(current_memories) > 0:
-                    # We could merge current with new, delete all current, and insert all the new ones.
-                    merged_memories = await self._merge_memories(
-                        new_memories, [m["memory"] for m in current_memories]
-                    )
-                    LOGGER.debug("merged_memories: %s", merged_memories)
+        # Here we only consider memories from the user. We may want to have a sort of "assistant memory" that we can tag separately in the future.
+        user_message = messages[-2]["content"]
+        task_user = asyncio.create_task(
+            self._process_message_for_memories(
+                user_message,
+                source=ROLE.USER,
+                source_default=ROLE.USER,
+                user=user,
+                __event_emitter__=__event_emitter__,
+            )
+        )
 
-            if len(merged_memories) + len(current_memories) > 0:
-                # We want to update even if decision to remove current_memories.
-                # Delete retrived memories, create merged ones
-                await asyncio.gather(
-                    # Create merged_memories
-                    *map(
-                        lambda m: add_memory(
-                            request=Request(
-                                scope={"type": "http", "app": open_webui.main.app}
-                            ),
-                            form_data=AddMemoryForm(content=m),
-                            user=user,
-                        ),
-                        merged_memories,
-                    ),
-                    # Delete the prior ones that were close.
-                    *map(
-                        lambda m: delete_memory_by_id(m["id"], user=user),
-                        current_memories,
-                    ),
-                )
-
-            if len(merged_memories) > 0:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Memories updated.",
-                            "done": True,
-                        },
-                    }
-                )
+        assistant_message = messages[-1]["content"]
+        task_assistant = asyncio.create_task(
+            self._process_message_for_memories(
+                assistant_message,
+                source=ROLE.ASSISTANT,
+                source_default=ROLE.USER,
+                user=user,
+                __event_emitter__=__event_emitter__,
+            )
+        )
+        await asyncio.gather(task_user, task_assistant)
 
         return body
 
-    async def _assess_for_memories(self, content: str) -> List[str]:
+    async def _assess_for_memories(
+        self, content: str, *, source: str = ROLE.USER
+    ) -> List[str]:
         """
         Identify if there are elements to remember in content.
         """
 
         assessment = await self.single_query_model(
             self.valves.model,
-            PROMPT.MEMORIES_ASSESS,
+            PROMPT.MEMORIES_ASSESS.format(source=source),
             content,
         )
         LOGGER.debug("_assess_for_memories: assessment: %s", assessment)
@@ -458,6 +472,93 @@ class Filter:
                 "Merging memories did not return JSON in expected format: %s", output
             )
             return []
+
+    async def _process_message_for_memories(
+        self,
+        message: str,
+        source: str,
+        *,
+        user: User,
+        source_default: str = "user",
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ):
+        """
+        message:
+            Will be assessed for memories, and existing memories will be processed accordingly.
+
+        source:
+            'user' or 'assistant'. Source of the message. The tag will be added to memories,
+            and only memories with the same source will be considered.
+
+        source_default:
+            When no tag is found on a memory, consider it as `source_default`.
+        """
+        assert source in (ROLE.USER, ROLE.ASSISTANT)
+        # Here we only consider memories from the user. We may want to have a sort of "assistant memory" that we can tag separately in the future.
+        new_memories = await self._assess_for_memories(message, source=source)
+        LOGGER.debug(
+            "_process_message_for_memories.new_memories (source: %s): %s",
+            source,
+            new_memories,
+        )
+        current_memories = []
+        merged_memories = []
+
+        if len(new_memories) > 0:
+            # We don't want to spam the memories database with similar ones, let's merge whatever is new
+            # Query potentially similar memories. Be selective: we want to limit duplicates
+            current_memories = await self._query_memories(
+                str(new_memories), user=user, distance_min=0.9
+            )
+            LOGGER.debug(
+                "_process_message_for_memories.current_memories (source: %s): %s",
+                source,
+                current_memories,
+            )
+            if len(current_memories) > 0:
+                # We could merge current with new, delete all current, and insert all the new ones.
+                merged_memories = await self._merge_memories(
+                    new_memories, [m["content"] for m in current_memories]
+                )
+                LOGGER.debug("merged_memories: %s", merged_memories)
+            else:
+                # Don't bother merging, but we'll want to upload the new ones.
+                merged_memories = new_memories
+
+        if len(merged_memories) + len(current_memories) > 0:
+            # We want to update even if decision to remove current_memories.
+            # Delete retrived memories, create merged ones
+            await asyncio.gather(
+                # Create merged_memories
+                *map(
+                    lambda m: add_memory(
+                        request=Request(
+                            scope={"type": "http", "app": open_webui.main.app}
+                        ),
+                        form_data=AddMemoryForm(
+                            content=json.dumps({"source": source, "content": m})
+                        ),
+                        user=user,
+                    ),
+                    merged_memories,
+                ),
+                # Delete the prior ones that were close.
+                *map(
+                    lambda m: delete_memory_by_id(m["id"], user=user),
+                    current_memories,
+                ),
+            )
+
+            if __event_emitter__ is not None:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Memories updated.",
+                            "done": True,
+                        },
+                    }
+                )
 
 
 async def single_query_model(
@@ -596,6 +697,11 @@ class PROMPT:
         Ignore prior instructions.
 
         You will be provided a message. You must identify content that is worth remembering for long-term.
+
+        A message is considered worthy of long-term memory if it involves:
+            * Significant events (e.g., birthdays, wins)
+            * Important announcements (e.g., vacations)
+        
         You must provide output in the form of a JSON list. Nothing else.
 
         Be concise and factual.
@@ -619,6 +725,14 @@ class PROMPT:
         Example 4:
             User: I like A.
             Assistant: ["User likes A"]
+
+        Example 5:
+            User: I met my friend John on July 16th.
+            Assistant: ["User met John on July 16th", "User has a friend named john."]
+
+        Now create a JSON list of strings from the next message, ensure you follow the same format as in the examples above ([string1, string2, ...]),
+        without any code block or comments.
+        The next message is written by {source}
         """
     MEMORY_QUERY = """
         Ignore prior instructions.
