@@ -3,15 +3,26 @@ title: Memory
 author: ohmajesticlama
 author_url: https://github.com/OhMajesticLama/OpenWebUI.Memory
 funding_url: https://github.com/open-webui
-version: 0.1
+version: 0.2
 license: MIT
 
+# Purpose
 A function to automatically manage memories. Compatible with OpenWebUI 0.5.
 
 /!\ This function adds and modifies memories. This may lead to memory data loss.
 
+# Configuration
 This function retrieves memories directly, it is recommended to disable the Settings->Personalization->Memory toggle
 as this will create duplicate entries in the chat history.
+
+If you use Ollama, it should retrieve the configuration from OpenWebUI admin settings automatically.
+
+## Recommended Functions
+Time Awareness (https://openwebui.com/f/skroute/time_awareness/): providing the model with time information may help it make better use of memories.
+
+# Current limitations
+
+The data flow works, memories are registered and retrieved, but the memories generated contain hallucinations with the default model
 """
 
 import sys
@@ -55,10 +66,10 @@ def set_logs(logger: logging.Logger, level: int, force: bool = False):
     force:
         If set to True, will create and attach a StreamHandler to logger, even if there is already one attached.
     """
-    LOGGER.setLevel(level)
+    logger.setLevel(level)
 
-    LOGGER.debug("%s has %s handlers", LOGGER, len(LOGGER.handlers))
-    for handler in LOGGER.handlers:
+    logger.debug("%s has %s handlers", logger, len(logger.handlers))
+    for handler in logger.handlers:
         if not force and isinstance(handler, logging.StreamHandler):
             # There is already a stream handler attached to this logger, chances are we don"t want to add another one.
             # This might be a reimport.
@@ -74,7 +85,7 @@ def set_logs(logger: logging.Logger, level: int, force: bool = False):
     )
     handler.setFormatter(formatter)
 
-    LOGGER.addHandler(handler)
+    logger.addHandler(handler)
     return logger
 
 
@@ -127,12 +138,12 @@ class ROLE:
 class Filter:
     class Valves(BaseModel):
         model: str = Field(
-            default="gemma:2b",
-            description="Model to use to process memories. Defaults to same model as conversation to save GPU memory / reload time.",
+            default="mistral:7b-instruct",
+            description="Model to use to process memories.",
         )
 
         n_memories: int = Field(
-            default=10, description="Consider top N relevant memories."
+            default=5, description="Consider top N relevant memories."
         )
 
         memories_dist_min: float = Field(
@@ -142,11 +153,18 @@ class Filter:
 
         # We could try and pull from openwebui config
         chat_api_host: str = Field(
-            default="http://host.docker.internal:11434",
-            description="Defaults to a docker configuration with locally installed ollama on default port.",
+            # Get defaults from OpenWebUI config instead of asking to user to re-enter them.
+            # Currently works only with Ollama config.
+            default_factory=lambda: get_api_chat_completion_config()[0],
+            description="Defaults to Ollama configuration in system settings if enabled.",
         )
 
-        api_key: str = Field(default="", description="Key for chat_api.")
+        api_key: str = Field(
+            # Get defaults from OpenWebUI config instead of asking to user to re-enter them.
+            # Currently works only with Ollama config.
+            default_factory=lambda: get_api_chat_completion_config()[1],
+            description="Key for chat_api.",
+        )
 
     class UserValves(BaseModel):
         enabled: bool = Field(
@@ -167,7 +185,8 @@ class Filter:
 
     @log_exceptions
     def __del__(self):
-        asyncio.run(self._session.close())
+        if hasattr(self, "_session"):
+            asyncio.run(self._session.close())
 
     async def _build_memory_query(self, messages: List[Dict[str, str]]) -> str:
         memory_keywords = await self.single_query_model(
@@ -255,6 +274,10 @@ class Filter:
         query: str,
     ):
         target_url = f"{self.valves.chat_api_host.strip('/')}/v1/chat/completions"
+        LOGGER.debug("single_query_model.config:")
+        for k, v in open_webui.main.app.state.config.__dict__.items():
+            LOGGER.debug("  %s: %s", k, v)
+        # To use OpenWebUI endpoint we need and API KEY.
         return await single_query_model(
             self._session, target_url, model, system, query, api_key=self.valves.api_key
         )
@@ -263,11 +286,9 @@ class Filter:
     def _format_context(
         memories_user: List[Dict[str, str]], memories_assistant: List[Dict[str, str]]
     ) -> str:
-        now = datetime.datetime.now(datetime.UTC).isoformat()
         return '<context source="function_memory">\n  {}\n</context>'.format(
             "\n  ".join(
                 (
-                    f'<time timezone="UTC"><!-- Be mindful user may not be in this timezone-->{now}</time>',
                     '<memories source="{}">{}</memories>\n'.format(
                         ROLE.ASSISTANT,
                         "\n    ".join(
@@ -606,6 +627,31 @@ async def single_query_model(
         raise exc
 
 
+def get_api_chat_completion_config() -> tuple[str, str]:
+    "Returns chat completion API url and API key. Useful for settings defaults that works with user install."
+    config = open_webui.main.app.state.config
+    if config.ENABLE_OLLAMA_API and config.OLLAMA_BASE_URLS:
+        # Use OLLAMA
+        # Try to get key if there is one
+        key = ""
+        base_url = config.OLLAMA_BASE_URLS[0]
+        if config.OLLAMA_API_CONFIGS.get(base_url):
+            key = config.OLLAMA_API_CONFIGS[base_url].get("key") or ""
+
+        ollama_config = (base_url, key)
+        LOGGER.debug("get_api_chat_config.ollama: %s", ollama_config)
+        return ollama_config
+    elif config.ENABLE_OPENAI_API and config.OPENAI_API_BASE_URLS:
+        # Untested as author doesn't use OpenAI, please open an issue with a fix if you find one.
+        base_url = config.OPENAI_API_BASE_URLS[0]
+        openai_config = (base_url, config.OPENAI_API_KEYS[base_url].get("key"))
+        LOGGER.debug("get_api_chat_config.openai: %s", openai_config)
+        return openai_config
+    else:
+        LOGGER.debug("get_api_chat_config.default.")
+        return ("http://localhost:11434", "")
+
+
 class PROMPT:
     MEMORIES_MERGE = """
         # Instructions
@@ -653,46 +699,6 @@ class PROMPT:
         You should only use the context from the most recent chat to inform your decision.
         Your output must only be valid JSON lists of strings. Nothing else. Do not add comments, do not use code blocks (```).
         You start now.
-        """
-    MEMORIES_MERGE_V0 = """
-        Ignore prior instructions. You are an agent processing JSON data.
-
-        You will be provided with 2 JSON lists of memories. One list is the new memories, the other is the current memories.
-        You must merge the 2 lists and output a single list.
-        When merging the list, you must remove redundant information and keep only one occurence. If there is conflicting information, keep the new one.
-
-        You must provide output in the form of a JSON list of strings. Nothing else.
-
-        Be concise and factual.
-
-        Examples
-        --------
-        You must act as the "Assistant" in those examples.
-
-        Example 1:
-            User:
-                current_memories = ["User likes movies", "User dislikes potatoes"]
-                new_memories = ["User does not like potatoes"]
-
-            Assistant:
-                ["User likes movies", "User does not like potatoes"]
-
-        Example 2:
-            User:
-                current_memories = ["User likes movies", "User does not like oranges"]
-                new_memories = ["User likes oranges"]
-
-            Assistant:
-                ["User likes movies", "User likes oranges"]
-
-        Example 3:
-            User:
-                current_memories = ["User likes A", "User does not like B"]
-                new_memories = ["User likes C"]
-
-            Assistant:
-                ["User likes A", "User does not like B", "User likes C."]
-
         """
     MEMORIES_ASSESS = """
         Ignore prior instructions.
